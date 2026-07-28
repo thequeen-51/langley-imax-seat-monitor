@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from playwright.sync_api import APIRequestContext, Page, sync_playwright
+from playwright.sync_api import (
+    APIRequestContext,
+    Page,
+    sync_playwright,
+)
 
 
 MOVIE_URL = (
@@ -17,6 +21,7 @@ THEATRE_NAME = "Cineplex Cinemas Langley"
 FILM_ID = "37617"
 
 DEBUG_DIR = Path("debug")
+
 SEAT_PRIORITY = [
     ("H", 10, 15),
     ("I", 10, 15),
@@ -24,7 +29,12 @@ SEAT_PRIORITY = [
 ]
 
 
-def click_first_visible(locator, description: str) -> bool:
+def click_first_visible(
+    locator: Any,
+    description: str,
+) -> bool:
+    """Click the first visible item in a Playwright locator."""
+
     for index in range(locator.count()):
         item = locator.nth(index)
 
@@ -33,17 +43,34 @@ def click_first_visible(locator, description: str) -> bool:
                 continue
 
             print(f"Clicking {description}")
+
             item.scroll_into_view_if_needed()
             item.click(timeout=10_000)
+
             return True
+
         except Exception as exc:
-            print(f"{description} click attempt failed: {exc}")
+            print(
+                f"{description} click attempt failed:",
+                type(exc).__name__,
+                str(exc),
+            )
 
     return False
 
 
 def close_cookie_banner(page: Page) -> None:
-    for label in ["OK", "Accept All", "Accept", "I Accept", "Agree"]:
+    """Close a cookie banner if Cineplex displays one."""
+
+    labels = [
+        "OK",
+        "Accept All",
+        "Accept",
+        "I Accept",
+        "Agree",
+    ]
+
+    for label in labels:
         try:
             button = page.get_by_role(
                 "button",
@@ -51,51 +78,109 @@ def close_cookie_banner(page: Page) -> None:
                 exact=True,
             )
 
-            if button.count() and button.first.is_visible():
+            if (
+                button.count() > 0
+                and button.first.is_visible()
+            ):
                 button.first.click(timeout=5_000)
                 page.wait_for_timeout(1_000)
                 return
+
         except Exception:
             pass
 
 
 def open_ticket_drawer(page: Page) -> None:
+    """Open the Cineplex ticket drawer."""
+
     candidates = [
-        page.get_by_role("button", name="Get Tickets", exact=True),
-        page.get_by_role("link", name="Get Tickets", exact=True),
-        page.get_by_text("Get Tickets", exact=True),
+        page.get_by_role(
+            "button",
+            name="Get Tickets",
+            exact=True,
+        ),
+        page.get_by_role(
+            "link",
+            name="Get Tickets",
+            exact=True,
+        ),
+        page.get_by_text(
+            "Get Tickets",
+            exact=True,
+        ),
     ]
 
     for candidate in candidates:
-        if click_first_visible(candidate, "Get Tickets"):
+        if click_first_visible(
+            candidate,
+            "Get Tickets",
+        ):
             page.wait_for_timeout(6_000)
             return
 
-    raise RuntimeError("Could not open the ticket drawer.")
+    raise RuntimeError(
+        "Could not open the ticket drawer."
+    )
 
 
 def select_langley(page: Page) -> None:
+    """Select Cineplex Cinemas Langley."""
+
     theatre_candidates = [
-        page.get_by_text("Theatres", exact=True),
-        page.get_by_text("Theatre", exact=True),
-        page.get_by_role("button", name="Theatres", exact=False),
-        page.get_by_role("button", name="Theatre", exact=False),
-        page.locator("button, [role='button']").filter(
+        page.get_by_text(
+            "Theatres",
+            exact=True,
+        ),
+        page.get_by_text(
+            "Theatre",
+            exact=True,
+        ),
+        page.get_by_role(
+            "button",
+            name="Theatres",
+            exact=False,
+        ),
+        page.get_by_role(
+            "button",
+            name="Theatre",
+            exact=False,
+        ),
+        page.locator(
+            "button, [role='button']"
+        ).filter(
             has_text="Theatre"
         ),
     ]
 
+    theatre_selector_opened = False
+
     for candidate in theatre_candidates:
-        if click_first_visible(candidate, "theatre selector"):
+        if click_first_visible(
+            candidate,
+            "theatre selector",
+        ):
             page.wait_for_timeout(3_000)
+            theatre_selector_opened = True
             break
-    else:
-        raise RuntimeError("Could not open theatre selector.")
+
+    if not theatre_selector_opened:
+        raise RuntimeError(
+            "Could not open theatre selector."
+        )
 
     search_candidates = [
-        page.get_by_placeholder("Search", exact=False),
-        page.get_by_placeholder("city", exact=False),
-        page.get_by_placeholder("theatre", exact=False),
+        page.get_by_placeholder(
+            "Search",
+            exact=False,
+        ),
+        page.get_by_placeholder(
+            "city",
+            exact=False,
+        ),
+        page.get_by_placeholder(
+            "theatre",
+            exact=False,
+        ),
         page.get_by_role("searchbox"),
         page.locator("input[type='search']"),
     ]
@@ -110,6 +195,7 @@ def select_langley(page: Page) -> None:
                 if field.is_visible():
                     search_field = field
                     break
+
             except Exception:
                 pass
 
@@ -117,25 +203,48 @@ def select_langley(page: Page) -> None:
             break
 
     if search_field is None:
-        raise RuntimeError("Could not find theatre search input.")
+        raise RuntimeError(
+            "Could not find theatre search input."
+        )
 
     search_field.fill("Langley")
     page.wait_for_timeout(4_000)
 
-    results = page.get_by_text(THEATRE_NAME, exact=True)
+    exact_results = page.get_by_text(
+        THEATRE_NAME,
+        exact=True,
+    )
 
-    if not click_first_visible(results, THEATRE_NAME):
-        results = page.get_by_text(THEATRE_NAME, exact=False)
+    if not click_first_visible(
+        exact_results,
+        THEATRE_NAME,
+    ):
+        partial_results = page.get_by_text(
+            THEATRE_NAME,
+            exact=False,
+        )
 
-        if not click_first_visible(results, THEATRE_NAME):
-            raise RuntimeError("Could not select Langley theatre.")
+        if not click_first_visible(
+            partial_results,
+            THEATRE_NAME,
+        ):
+            raise RuntimeError(
+                "Could not select Langley theatre."
+            )
 
     page.wait_for_timeout(7_000)
     print("Langley selected.")
 
 
-def clean_api_headers(headers: dict[str, str]) -> dict[str, str]:
-    allowed = {
+def clean_api_headers(
+    headers: dict[str, str],
+) -> dict[str, str]:
+    """
+    Keep only headers needed when repeating Cineplex API
+    requests.
+    """
+
+    allowed_headers = {
         "accept",
         "accept-language",
         "ocp-apim-subscription-key",
@@ -147,7 +256,7 @@ def clean_api_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
         key: value
         for key, value in headers.items()
-        if key.lower() in allowed
+        if key.lower() in allowed_headers
     }
 
 
@@ -156,6 +265,8 @@ def api_get_json(
     url: str,
     headers: dict[str, str],
 ) -> Any:
+    """Call a Cineplex API and parse its JSON response."""
+
     print(f"API GET: {url}")
 
     response = api.get(
@@ -167,15 +278,21 @@ def api_get_json(
     print(f"API HTTP: {response.status}")
 
     if not response.ok:
+        response_text = response.text()
+
         raise RuntimeError(
-            f"API request failed: HTTP {response.status} "
-            f"{response.text()[:500]}"
+            f"API request failed: HTTP {response.status}. "
+            f"{response_text[:500]}"
         )
 
     return response.json()
 
 
-def extract_date_strings(value: Any) -> set[str]:
+def extract_date_strings(
+    value: Any,
+) -> set[str]:
+    """Recursively extract YYYY-MM-DD date strings."""
+
     results: set[str] = set()
 
     if isinstance(value, str):
@@ -187,16 +304,24 @@ def extract_date_strings(value: Any) -> set[str]:
 
     elif isinstance(value, list):
         for item in value:
-            results.update(extract_date_strings(item))
+            results.update(
+                extract_date_strings(item)
+            )
 
     elif isinstance(value, dict):
         for item in value.values():
-            results.update(extract_date_strings(item))
+            results.update(
+                extract_date_strings(item)
+            )
 
     return results
 
 
-def extract_sessions(value: Any) -> list[dict[str, str]]:
+def extract_sessions(
+    value: Any,
+) -> list[dict[str, str]]:
+    """Recursively extract showtime sessions from API JSON."""
+
     sessions: list[dict[str, str]] = []
 
     def walk(item: Any) -> None:
@@ -232,17 +357,25 @@ def extract_sessions(value: Any) -> list[dict[str, str]]:
 
     walk(value)
 
-    unique: dict[str, dict[str, str]] = {}
+    unique_sessions: dict[
+        str,
+        dict[str, str],
+    ] = {}
 
     for session in sessions:
-        unique[session["showtime_id"]] = session
+        unique_sessions[
+            session["showtime_id"]
+        ] = session
 
-    return list(unique.values())
+    return list(unique_sessions.values())
 
-def build_seat_lookup(layout: Any) -> dict[str, str]:
+
+def build_seat_lookup(
+    layout: Any,
+) -> dict[str, str]:
     """
-    Build a mapping like:
-    Cineplex internal seat ID -> visible seat label, e.g. H12
+    Build a mapping from Cineplex internal seat ID
+    to visible seat label such as H12.
     """
 
     lookup: dict[str, str] = {}
@@ -257,10 +390,18 @@ def build_seat_lookup(layout: Any) -> dict[str, str]:
                 or item.get("name")
             )
 
-            if seat_id is not None and isinstance(label, str):
-                normalized = label.strip().upper()
+            if (
+                seat_id is not None
+                and isinstance(label, str)
+            ):
+                normalized = (
+                    label.strip().upper()
+                )
 
-                if re.fullmatch(r"[A-Z]+\d+", normalized):
+                if re.fullmatch(
+                    r"[A-Z]+\d+",
+                    normalized,
+                ):
                     lookup[str(seat_id)] = normalized
 
             for child in item.values():
@@ -271,6 +412,7 @@ def build_seat_lookup(layout: Any) -> dict[str, str]:
                 walk(child)
 
     walk(layout)
+
     return lookup
 
 
@@ -278,12 +420,20 @@ def find_preferred_pair(
     layout: Any,
     availability: Any,
 ) -> tuple[str, str] | None:
+    """
+    Find two adjacent available seats using the priority:
+    H first, then I, then G.
+    """
+
     seat_lookup = build_seat_lookup(layout)
 
     if not isinstance(availability, dict):
         return None
 
-    statuses = availability.get("seatAvailabilities", {})
+    statuses = availability.get(
+        "seatAvailabilities",
+        {},
+    )
 
     if not isinstance(statuses, dict):
         return None
@@ -299,10 +449,26 @@ def find_preferred_pair(
         if label:
             available_labels.add(label)
 
-    # Strict priority:
-    # H10-H15 first, then I10-I15, then G10-G15.
-    for row, first_number, last_number in SEAT_PRIORITY:
-        for number in range(first_number, last_number):
+    preferred_available = sorted(
+        label
+        for label in available_labels
+        if label[:1] in {"H", "I", "G"}
+    )
+
+    print(
+        "Available preferred-area seats:",
+        preferred_available,
+    )
+
+    for (
+        row,
+        first_number,
+        last_number,
+    ) in SEAT_PRIORITY:
+        for number in range(
+            first_number,
+            last_number,
+        ):
             seat_one = f"{row}{number}"
             seat_two = f"{row}{number + 1}"
 
@@ -320,6 +486,8 @@ def check_showtime_seats(
     headers: dict[str, str],
     showtime_id: str,
 ) -> tuple[str, str] | None:
+    """Download and check seats for one showtime."""
+
     base_url = (
         "https://apis.cineplex.com/prod/"
         f"ticketing/api/v1/theatre/{THEATRE_ID}/"
@@ -339,20 +507,38 @@ def check_showtime_seats(
     )
 
     if isinstance(availability, dict):
-        if availability.get("isPostShowtime") is True:
-            print("Skipping: showtime has already passed.")
+        if (
+            availability.get("isPostShowtime")
+            is True
+        ):
+            print(
+                "Skipping: showtime has already passed."
+            )
             return None
 
-        if availability.get("isSoldOut") is True:
-            print("Skipping: showtime is sold out.")
+        if (
+            availability.get("isSoldOut")
+            is True
+        ):
+            print(
+                "Skipping: showtime is sold out."
+            )
             return None
 
     return find_preferred_pair(
         layout,
         availability,
     )
+
+
 def main() -> None:
+    """Run the complete Langley IMAX 70mm seat check."""
+
     DEBUG_DIR.mkdir(exist_ok=True)
+
+    print(
+        "Starting Langley IMAX 70mm monitor test."
+    )
 
     captured_headers: dict[str, str] | None = None
 
@@ -361,14 +547,20 @@ def main() -> None:
             headless=True,
             args=[
                 "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
+                (
+                    "--disable-blink-features="
+                    "AutomationControlled"
+                ),
             ],
         )
 
         context = browser.new_context(
             locale="en-CA",
             timezone_id="America/Vancouver",
-            viewport={"width": 1440, "height": 1200},
+            viewport={
+                "width": 1440,
+                "height": 1200,
+            },
             user_agent=(
                 "Mozilla/5.0 "
                 "(Macintosh; Intel Mac OS X 10_15_7) "
@@ -380,31 +572,48 @@ def main() -> None:
 
         page = context.new_page()
 
-        def capture_request(request) -> None:
+        def capture_request(request: Any) -> None:
             nonlocal captured_headers
 
             url = request.url.lower()
 
-            if (
+            is_cineplex_api = (
                 "apis.cineplex.com" in url
-                and (
-                    "/showtimes?" in url
-                    or "/dates/bookable?" in url
-                )
+            )
+
+            is_useful_request = (
+                "/showtimes?" in url
+                or "/dates/bookable?" in url
+            )
+
+            if (
+                is_cineplex_api
+                and is_useful_request
             ):
                 headers = clean_api_headers(
                     request.all_headers()
                 )
 
-                if "ocp-apim-subscription-key" in {
-                    key.lower() for key in headers
-                }:
+                header_names = {
+                    key.lower()
+                    for key in headers
+                }
+
+                if (
+                    "ocp-apim-subscription-key"
+                    in header_names
+                ):
                     captured_headers = headers
+
                     print(
-                        "Captured authenticated Cineplex API headers."
+                        "Captured authenticated "
+                        "Cineplex API headers."
                     )
 
-        page.on("request", capture_request)
+        page.on(
+            "request",
+            capture_request,
+        )
 
         response = page.goto(
             MOVIE_URL,
@@ -418,18 +627,31 @@ def main() -> None:
         )
 
         page.wait_for_timeout(10_000)
+
         close_cookie_banner(page)
         open_ticket_drawer(page)
         select_langley(page)
 
         page.wait_for_timeout(8_000)
 
+        page.screenshot(
+            path=str(
+                DEBUG_DIR
+                / "langley-selected.png"
+            ),
+            full_page=True,
+        )
+
         if captured_headers is None:
             raise RuntimeError(
-                "Could not capture Cineplex API authentication headers."
+                "Could not capture Cineplex API "
+                "authentication headers."
             )
 
-        print("Authentication headers captured successfully.")
+        print(
+            "Authentication headers captured "
+            "successfully."
+        )
 
         dates_url = (
             "https://apis.cineplex.com/prod/"
@@ -448,7 +670,9 @@ def main() -> None:
             captured_headers,
         )
 
-        (DEBUG_DIR / "bookable-dates.json").write_text(
+        (
+            DEBUG_DIR / "bookable-dates.json"
+        ).write_text(
             json.dumps(
                 dates_payload,
                 ensure_ascii=False,
@@ -457,15 +681,26 @@ def main() -> None:
             encoding="utf-8",
         )
 
-        dates = sorted(extract_date_strings(dates_payload))
+        dates = sorted(
+            extract_date_strings(
+                dates_payload
+            )
+        )
 
-        print(f"Bookable dates found: {len(dates)}")
+        print(
+            f"Bookable dates found: {len(dates)}"
+        )
 
-        all_sessions: list[dict[str, str]] = []
+        all_sessions: list[
+            dict[str, str]
+        ] = []
 
         for date_text in dates:
             year, month, day = date_text.split("-")
-            cineplex_date = f"{int(month)}/{int(day)}/{year}"
+
+            cineplex_date = (
+                f"{int(month)}/{int(day)}/{year}"
+            )
 
             showtimes_url = (
                 "https://apis.cineplex.com/prod/"
@@ -487,11 +722,18 @@ def main() -> None:
                     showtimes_url,
                     captured_headers,
                 )
+
             except Exception as exc:
-                print(f"Could not load {date_text}: {exc}")
+                print(
+                    f"Could not load {date_text}:",
+                    type(exc).__name__,
+                    str(exc),
+                )
                 continue
 
-            sessions = extract_sessions(payload)
+            sessions = extract_sessions(
+                payload
+            )
 
             print(
                 f"{date_text}: "
@@ -502,7 +744,10 @@ def main() -> None:
                 session["date"] = date_text
                 all_sessions.append(session)
 
-        unique_sessions: dict[str, dict[str, str]] = {
+        unique_sessions: dict[
+            str,
+            dict[str, str],
+        ] = {
             item["showtime_id"]: item
             for item in all_sessions
         }
@@ -515,7 +760,9 @@ def main() -> None:
             ),
         )
 
-        (DEBUG_DIR / "all-showtimes.json").write_text(
+        (
+            DEBUG_DIR / "all-showtimes.json"
+        ).write_text(
             json.dumps(
                 final_sessions,
                 ensure_ascii=False,
@@ -530,26 +777,50 @@ def main() -> None:
             print(
                 session.get("date", ""),
                 session.get("start_time", ""),
-                f"showtimeId={session['showtime_id']}",
+                (
+                    "showtimeId="
+                    f'{session["showtime_id"]}'
+                ),
             )
 
-               print(
-            f"\nTotal unique showtimes: "
-            f"{len(final_sessions)}"
+        print(
+            "\nTotal unique showtimes:",
+            len(final_sessions),
         )
+
+        if not final_sessions:
+            raise RuntimeError(
+                "No Langley IMAX 70mm "
+                "showtimes were discovered."
+            )
 
         print("\nSTARTING SEAT CHECKS")
 
-        matches: list[dict[str, str]] = []
-        failed_checks: list[dict[str, str]] = []
+        matches: list[
+            dict[str, str]
+        ] = []
+
+        failed_checks: list[
+            dict[str, str]
+        ] = []
 
         for index, session in enumerate(
             final_sessions,
             start=1,
         ):
-            showtime_id = session["showtime_id"]
-            date_text = session.get("date", "")
-            start_time = session.get("start_time", "")
+            showtime_id = session[
+                "showtime_id"
+            ]
+
+            date_text = session.get(
+                "date",
+                "",
+            )
+
+            start_time = session.get(
+                "start_time",
+                "",
+            )
 
             print(
                 f"\n[{index}/{len(final_sessions)}] "
@@ -579,6 +850,7 @@ def main() -> None:
                         "error": str(exc),
                     }
                 )
+
                 continue
 
             if pair is None:
@@ -586,7 +858,8 @@ def main() -> None:
                 continue
 
             print(
-                f"MATCH FOUND: {pair[0]} + {pair[1]}"
+                f"MATCH FOUND: "
+                f"{pair[0]} + {pair[1]}"
             )
 
             matches.append(
@@ -599,7 +872,9 @@ def main() -> None:
                 }
             )
 
-        (DEBUG_DIR / "seat-matches.json").write_text(
+        (
+            DEBUG_DIR / "seat-matches.json"
+        ).write_text(
             json.dumps(
                 matches,
                 ensure_ascii=False,
@@ -608,7 +883,10 @@ def main() -> None:
             encoding="utf-8",
         )
 
-        (DEBUG_DIR / "failed-seat-checks.json").write_text(
+        (
+            DEBUG_DIR
+            / "failed-seat-checks.json"
+        ).write_text(
             json.dumps(
                 failed_checks,
                 ensure_ascii=False,
@@ -618,34 +896,54 @@ def main() -> None:
         )
 
         print("\nSEAT CHECK SUMMARY")
-        print(f"Showtimes checked: {len(final_sessions)}")
-        print(f"Preferred pairs found: {len(matches)}")
-        print(f"Failed checks: {len(failed_checks)}")
+
+        print(
+            "Showtimes checked:",
+            len(final_sessions),
+        )
+
+        print(
+            "Preferred pairs found:",
+            len(matches),
+        )
+
+        print(
+            "Failed checks:",
+            len(failed_checks),
+        )
 
         if matches:
-            print("\nAVAILABLE PREFERRED SEATS")
+            print(
+                "\nAVAILABLE PREFERRED SEATS"
+            )
 
             for match in matches:
                 print(
                     match["date"],
                     match["start_time"],
-                    f'{match["seat_one"]} + {match["seat_two"]}',
-                    f'showtimeId={match["showtime_id"]}',
+                    (
+                        f'{match["seat_one"]} + '
+                        f'{match["seat_two"]}'
+                    ),
+                    (
+                        "showtimeId="
+                        f'{match["showtime_id"]}'
+                    ),
                 )
+
         else:
             print(
-                "No preferred adjacent seats are currently available."
+                "No preferred adjacent seats "
+                "are currently available."
             )
 
         context.close()
         browser.close()
 
-    if not final_sessions:
-        raise RuntimeError(
-            "No Langley IMAX 70mm showtimes were discovered."
-        )
-
-    print("All-showtimes discovery completed successfully.")
+    print(
+        "All-showtimes and seat checking "
+        "completed successfully."
+    )
 
 
 if __name__ == "__main__":
