@@ -1,4 +1,4 @@
-name: Monitor Setup Test
+name: Cineplex Browser Test
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
 jobs:
   test-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -16,8 +17,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Chromium browser
+        run: python -m playwright install --with-deps chromium
 
       - name: Run monitor
         run: python monitor.py
+
+      - name: Upload browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cineplex-browser-test
+          path: debug/
+          if-no-files-found: warn
+          retention-days: 3
