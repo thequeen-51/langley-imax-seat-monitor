@@ -1,7 +1,9 @@
+import json
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.sync_api import Locator, Page, sync_playwright
+from playwright.sync_api import Locator, Page, Response, sync_playwright
 
 
 MOVIE_URL = (
@@ -12,25 +14,27 @@ MOVIE_URL = (
 TARGET_THEATRE = "Cineplex Cinemas Langley"
 
 
-def save_page(page: Page, folder: Path, name: str) -> None:
-    """Save screenshot, HTML, visible text and URL."""
+def safe_filename(value: str, limit: int = 120) -> str:
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", value)
+    return value[:limit].strip("_") or "response"
 
+
+def save_page(page: Page, folder: Path, name: str) -> None:
     try:
         page.screenshot(
             path=str(folder / f"{name}.png"),
             full_page=True,
         )
     except Exception as exc:
-        print(f"Screenshot failed for {name}: {exc}")
+        print(f"Could not save screenshot {name}: {exc}")
 
     try:
-        html = page.content()
         (folder / f"{name}.html").write_text(
-            html,
+            page.content(),
             encoding="utf-8",
         )
     except Exception as exc:
-        print(f"HTML save failed for {name}: {exc}")
+        print(f"Could not save HTML {name}: {exc}")
 
     try:
         text = page.locator("body").inner_text(timeout=15_000)
@@ -43,7 +47,9 @@ def save_page(page: Page, folder: Path, name: str) -> None:
     )
 
 
-def click_first_visible(locator: Locator, label: str) -> bool:
+def click_first_visible(locator: Locator, description: str) -> bool:
+    print(f"{description}: {locator.count()} candidate(s)")
+
     for index in range(locator.count()):
         item = locator.nth(index)
 
@@ -51,14 +57,22 @@ def click_first_visible(locator: Locator, label: str) -> bool:
             if not item.is_visible():
                 continue
 
-            print(f"Clicking {label} candidate #{index + 1}")
+            print(f"Clicking {description} candidate #{index + 1}")
             item.scroll_into_view_if_needed()
-            item.click(timeout=10_000)
+            page_box = item.bounding_box()
+            print(f"Bounding box: {page_box}")
+
+            try:
+                item.click(timeout=10_000)
+            except Exception as exc:
+                print(f"Normal click failed: {exc}")
+                item.evaluate("element => element.click()")
+
             return True
 
         except Exception as exc:
             print(
-                f"{label} click failed: "
+                f"{description} candidate #{index + 1} failed: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -76,8 +90,8 @@ def close_cookie_banner(page: Page) -> None:
 
             if button.count() and button.first.is_visible():
                 button.first.click(timeout=5_000)
-                print(f"Closed cookie banner: {label}")
                 page.wait_for_timeout(1_500)
+                print(f"Closed cookie banner: {label}")
                 return
         except Exception:
             pass
@@ -95,7 +109,7 @@ def open_ticket_drawer(page: Page) -> None:
             page.wait_for_timeout(6_000)
             return
 
-    raise RuntimeError("Could not open the ticket drawer.")
+    raise RuntimeError("Could not open ticket drawer.")
 
 
 def select_langley(page: Page) -> None:
@@ -109,15 +123,11 @@ def select_langley(page: Page) -> None:
         ),
     ]
 
-    opened = False
-
     for candidate in theatre_candidates:
         if click_first_visible(candidate, "theatre selector"):
-            opened = True
             page.wait_for_timeout(3_000)
             break
-
-    if not opened:
+    else:
         raise RuntimeError("Could not open theatre selector.")
 
     search_candidates = [
@@ -145,7 +155,7 @@ def select_langley(page: Page) -> None:
             break
 
     if search_field is None:
-        raise RuntimeError("Could not find theatre search field.")
+        raise RuntimeError("Could not find theatre search input.")
 
     search_field.fill("Langley")
     page.wait_for_timeout(4_000)
@@ -163,59 +173,101 @@ def select_langley(page: Page) -> None:
     body_text = page.locator("body").inner_text(timeout=15_000)
 
     if TARGET_THEATRE.lower() not in body_text.lower():
-        raise RuntimeError("Langley selection could not be confirmed.")
+        raise RuntimeError("Langley theatre selection was not confirmed.")
 
-    print("Langley theatre selected successfully.")
+    print("Langley theatre selected.")
 
 
-def find_showtime_buttons(page: Page) -> list[Locator]:
-    """Return all visible buttons whose aria-label starts with Book show at."""
+def click_preview_seats(page: Page) -> None:
+    candidates = [
+        page.get_by_role(
+            "button",
+            name=re.compile(r"preview seats", re.IGNORECASE),
+        ),
+        page.get_by_role(
+            "link",
+            name=re.compile(r"preview seats", re.IGNORECASE),
+        ),
+        page.get_by_text(
+            re.compile(r"preview seats", re.IGNORECASE),
+        ),
+    ]
 
-    locator = page.locator(
-        'button[aria-label^="Book show at"]'
-    )
+    for candidate in candidates:
+        if click_first_visible(candidate, "Preview seats"):
+            print("Preview seats click issued.")
+            return
 
-    buttons: list[Locator] = []
+    matches = page.locator(
+        "button, a, [role='button'], div, span"
+    ).filter(has_text=re.compile(r"Preview seats", re.IGNORECASE))
 
-    print(f"Book-show button count: {locator.count()}")
+    print(f"Preview seats fallback matches: {matches.count()}")
 
-    for index in range(locator.count()):
-        item = locator.nth(index)
+    for index in range(min(matches.count(), 30)):
+        item = matches.nth(index)
 
         try:
             if not item.is_visible():
                 continue
 
-            label = item.get_attribute("aria-label")
-            text = item.inner_text().strip()
-
-            print(
-                f"SHOWTIME #{len(buttons) + 1}: "
-                f"text={text!r}, aria-label={label!r}"
+            info = item.evaluate(
+                """
+                element => ({
+                    tag: element.tagName,
+                    text: (element.innerText || "").trim(),
+                    html: element.outerHTML
+                })
+                """
             )
 
-            buttons.append(item)
+            print(f"Preview fallback element: {info}")
+
+            item.evaluate(
+                """
+                element => {
+                    const clickable = element.closest(
+                        'button, a, [role="button"]'
+                    );
+                    (clickable || element).click();
+                }
+                """
+            )
+
+            print("Preview seats JavaScript fallback click issued.")
+            return
 
         except Exception as exc:
-            print(f"Could not inspect showtime #{index + 1}: {exc}")
+            print(f"Preview fallback failed: {exc}")
 
-    return buttons
-
-
-def save_network_log(lines: list[str], folder: Path) -> None:
-    (folder / "network-log.txt").write_text(
-        "\n".join(lines),
-        encoding="utf-8",
-    )
+    raise RuntimeError("Could not find or click Preview seats.")
 
 
 def main() -> None:
     debug_dir = Path("debug")
+    responses_dir = debug_dir / "responses"
+
     debug_dir.mkdir(exist_ok=True)
+    responses_dir.mkdir(exist_ok=True)
 
-    network_log: list[str] = []
+    network_lines: list[str] = []
+    response_counter = 0
 
-    print("Starting Cineplex showtime-click investigation")
+    interesting_keywords = [
+        "seat",
+        "preview",
+        "showtime",
+        "performance",
+        "availability",
+        "auditorium",
+        "layout",
+        "booking",
+        "ticket",
+        "reservation",
+        "checkout",
+        "connect.cineplex",
+        "apis.cineplex",
+    ]
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
@@ -239,29 +291,89 @@ def main() -> None:
 
         page = context.new_page()
 
-        def record_response(response) -> None:
+        def record_request(request) -> None:
+            url_lower = request.url.lower()
+
+            if any(word in url_lower for word in interesting_keywords):
+                line = f"REQUEST {request.method} {request.url}"
+                print(line)
+                network_lines.append(line)
+
+        def record_response(response: Response) -> None:
+            nonlocal response_counter
+
             url_lower = response.url.lower()
 
-            keywords = [
-                "seat",
-                "showtime",
-                "performance",
-                "booking",
-                "ticket",
-                "checkout",
-                "reservation",
-                "schedule",
-            ]
+            if not any(
+                word in url_lower
+                for word in interesting_keywords
+            ):
+                return
 
-            if any(word in url_lower for word in keywords):
-                line = (
-                    f"{response.status} "
-                    f"{response.request.method} "
-                    f"{response.url}"
+            line = (
+                f"RESPONSE {response.status} "
+                f"{response.request.method} {response.url}"
+            )
+
+            print(line)
+            network_lines.append(line)
+
+            try:
+                content_type = (
+                    response.headers.get("content-type", "").lower()
                 )
-                print(f"NETWORK: {line}")
-                network_log.append(line)
 
+                if (
+                    "json" not in content_type
+                    and "text" not in content_type
+                    and "javascript" not in content_type
+                ):
+                    return
+
+                body = response.text()
+
+                if not body:
+                    return
+
+                response_counter += 1
+                parsed_url = urlparse(response.url)
+                name = safe_filename(
+                    f"{response_counter:03d}_"
+                    f"{parsed_url.netloc}_"
+                    f"{parsed_url.path}"
+                )
+
+                extension = (
+                    ".json"
+                    if "json" in content_type
+                    else ".txt"
+                )
+
+                output_path = responses_dir / f"{name}{extension}"
+                output_path.write_text(body, encoding="utf-8")
+
+                meta_path = responses_dir / f"{name}.meta.txt"
+                meta_path.write_text(
+                    "\n".join(
+                        [
+                            f"URL: {response.url}",
+                            f"Status: {response.status}",
+                            f"Method: {response.request.method}",
+                            f"Content-Type: {content_type}",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+                print(f"Saved response body: {output_path}")
+
+            except Exception as exc:
+                print(
+                    f"Could not save response body: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        page.on("request", record_request)
         page.on("response", record_response)
 
         try:
@@ -285,34 +397,16 @@ def main() -> None:
             save_page(
                 page,
                 debug_dir,
-                "01-langley-showtimes",
+                "01-before-preview-seats",
             )
 
-            showtimes = find_showtime_buttons(page)
+            click_preview_seats(page)
 
-            if not showtimes:
-                raise RuntimeError(
-                    "No bookable showtime buttons were found."
-                )
+            print("Waiting for preview-seat response...")
+            page.wait_for_timeout(20_000)
 
-            first_showtime = showtimes[0]
-            selected_time = first_showtime.inner_text().strip()
-
-            print(f"Testing first available showtime: {selected_time}")
-
-            pages_before = len(context.pages)
-            old_url = page.url
-
-            first_showtime.scroll_into_view_if_needed()
-            first_showtime.click(timeout=15_000)
-
-            print("Showtime click issued.")
-            page.wait_for_timeout(15_000)
-
-            print(f"Original URL before click: {old_url}")
-            print(f"Original page URL now: {page.url}")
-            print(f"Browser pages before click: {pages_before}")
-            print(f"Browser pages after click: {len(context.pages)}")
+            print(f"Current URL: {page.url}")
+            print(f"Open browser pages: {len(context.pages)}")
 
             for index, current_page in enumerate(
                 context.pages,
@@ -321,49 +415,46 @@ def main() -> None:
                 try:
                     current_page.wait_for_load_state(
                         "domcontentloaded",
-                        timeout=30_000,
+                        timeout=20_000,
                     )
-                except Exception:
-                    pass
-
-                title = ""
-
-                try:
-                    title = current_page.title()
                 except Exception:
                     pass
 
                 print(
                     f"PAGE #{index}: "
-                    f"title={title!r}, "
+                    f"title={current_page.title()!r}, "
                     f"url={current_page.url}"
                 )
 
                 save_page(
                     current_page,
                     debug_dir,
-                    f"02-after-showtime-page-{index}",
+                    f"02-after-preview-page-{index}",
                 )
 
-            save_network_log(network_log, debug_dir)
-
-            print("Showtime-click investigation finished.")
+            print(
+                f"Saved {response_counter} relevant response bodies."
+            )
 
         except Exception as exc:
             print(
-                f"SHOWTIME CLICK FAILED: "
+                f"PREVIEW-SEATS TEST FAILED: "
                 f"{type(exc).__name__}: {exc}"
             )
 
             try:
                 save_page(page, debug_dir, "error")
-                save_network_log(network_log, debug_dir)
             except Exception:
                 pass
 
             raise
 
         finally:
+            (debug_dir / "network-log.txt").write_text(
+                "\n".join(network_lines),
+                encoding="utf-8",
+            )
+
             context.close()
             browser.close()
 
