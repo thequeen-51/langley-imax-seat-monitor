@@ -1,73 +1,124 @@
-import json
-from datetime import date, timedelta
+from pathlib import Path
 
-import requests
+from playwright.sync_api import sync_playwright
 
 
-THEATRE_ID = "1405"
-MOVIE_KEYWORD = "odyssey"
-DAYS_TO_CHECK = 30
+CINEPLEX_URL = "https://www.cineplex.com/theatre/cineplex-cinemas-langley"
 
 
 def main() -> None:
-    print("Starting Cineplex showtime discovery test")
-    print(f"Theatre ID: {THEATRE_ID}")
+    debug_dir = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
 
-    found = []
+    print("Starting Cineplex browser test")
+    print(f"Opening: {CINEPLEX_URL}")
 
-    for offset in range(DAYS_TO_CHECK):
-        show_date = date.today() + timedelta(days=offset)
-        date_text = show_date.isoformat()
-
-        url = (
-            "https://apis.cineplex.com/prod/cpx/theatrical/api/v1/"
-            f"showtimes?language=en-us&locationId={THEATRE_ID}&date={date_text}"
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
         )
 
-        print(f"Checking {date_text}")
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1200},
+            locale="en-CA",
+            timezone_id="America/Vancouver",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        )
+
+        page = context.new_page()
 
         try:
-            response = requests.get(
-                url,
-                timeout=30,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 Chrome/126 Safari/537.36"
-                    ),
-                    "Accept": "application/json",
-                },
+            response = page.goto(
+                CINEPLEX_URL,
+                wait_until="domcontentloaded",
+                timeout=90000,
             )
 
-            print(f"HTTP status: {response.status_code}")
+            if response:
+                print(f"HTTP status: {response.status}")
+            else:
+                print("No HTTP response object was returned.")
 
-            if response.status_code != 200:
-                continue
+            page.wait_for_timeout(10000)
 
-            data = response.json()
+            # Try to close common cookie/privacy popups.
+            popup_labels = [
+                "Accept",
+                "Accept All",
+                "I Accept",
+                "Agree",
+                "Got it",
+            ]
 
-            # Save one response for diagnosis.
-            if offset == 0:
-                with open("cineplex-response.json", "w", encoding="utf-8") as file:
-                    json.dump(data, file, ensure_ascii=False, indent=2)
+            for label in popup_labels:
+                try:
+                    button = page.get_by_role("button", name=label, exact=False)
+                    if button.count() > 0:
+                        button.first.click(timeout=2000)
+                        print(f"Closed popup using button: {label}")
+                        page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    pass
 
-            text = json.dumps(data, ensure_ascii=False).lower()
+            title = page.title()
+            body_text = page.locator("body").inner_text(timeout=30000)
 
-            if MOVIE_KEYWORD in text:
-                print(f"Possible Odyssey result found on {date_text}")
-                found.append(date_text)
+            print(f"Page title: {title}")
+            print(f"Final URL: {page.url}")
+            print(f"Body text length: {len(body_text)}")
+
+            if "the odyssey" in body_text.lower():
+                print("SUCCESS: The Odyssey was found on the page.")
+            else:
+                print("WARNING: The Odyssey was not found in visible page text.")
+
+            # Save page text for diagnosis.
+            (debug_dir / "page-text.txt").write_text(
+                body_text,
+                encoding="utf-8",
+            )
+
+            # Save the rendered page.
+            page.screenshot(
+                path=str(debug_dir / "cineplex-langley.png"),
+                full_page=True,
+            )
+
+            # Save the HTML.
+            (debug_dir / "page.html").write_text(
+                page.content(),
+                encoding="utf-8",
+            )
+
+            print("Saved diagnostic files in the debug folder.")
 
         except Exception as exc:
-            print(f"Error on {date_text}: {type(exc).__name__}: {exc}")
+            print(f"Browser test failed: {type(exc).__name__}: {exc}")
 
-    if found:
-        print("Possible matching dates:")
-        for item in found:
-            print(f"- {item}")
-    else:
-        print("No Odyssey result found in the tested dates.")
+            try:
+                page.screenshot(
+                    path=str(debug_dir / "error.png"),
+                    full_page=True,
+                )
+            except Exception:
+                pass
 
-    print("Discovery test finished.")
+            raise
+
+        finally:
+            context.close()
+            browser.close()
+
+    print("Cineplex browser test finished.")
 
 
 if __name__ == "__main__":
