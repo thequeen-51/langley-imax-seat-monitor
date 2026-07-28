@@ -17,6 +17,11 @@ THEATRE_NAME = "Cineplex Cinemas Langley"
 FILM_ID = "37617"
 
 DEBUG_DIR = Path("debug")
+SEAT_PRIORITY = [
+    ("H", 10, 15),
+    ("I", 10, 15),
+    ("G", 10, 15),
+]
 
 
 def click_first_visible(locator, description: str) -> bool:
@@ -234,7 +239,118 @@ def extract_sessions(value: Any) -> list[dict[str, str]]:
 
     return list(unique.values())
 
+def build_seat_lookup(layout: Any) -> dict[str, str]:
+    """
+    Build a mapping like:
+    Cineplex internal seat ID -> visible seat label, e.g. H12
+    """
 
+    lookup: dict[str, str] = {}
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            seat_id = item.get("id")
+
+            label = (
+                item.get("label")
+                or item.get("seatLabel")
+                or item.get("name")
+            )
+
+            if seat_id is not None and isinstance(label, str):
+                normalized = label.strip().upper()
+
+                if re.fullmatch(r"[A-Z]+\d+", normalized):
+                    lookup[str(seat_id)] = normalized
+
+            for child in item.values():
+                walk(child)
+
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(layout)
+    return lookup
+
+
+def find_preferred_pair(
+    layout: Any,
+    availability: Any,
+) -> tuple[str, str] | None:
+    seat_lookup = build_seat_lookup(layout)
+
+    if not isinstance(availability, dict):
+        return None
+
+    statuses = availability.get("seatAvailabilities", {})
+
+    if not isinstance(statuses, dict):
+        return None
+
+    available_labels: set[str] = set()
+
+    for seat_id, status in statuses.items():
+        if str(status).lower() != "available":
+            continue
+
+        label = seat_lookup.get(str(seat_id))
+
+        if label:
+            available_labels.add(label)
+
+    # Strict priority:
+    # H10-H15 first, then I10-I15, then G10-G15.
+    for row, first_number, last_number in SEAT_PRIORITY:
+        for number in range(first_number, last_number):
+            seat_one = f"{row}{number}"
+            seat_two = f"{row}{number + 1}"
+
+            if (
+                seat_one in available_labels
+                and seat_two in available_labels
+            ):
+                return seat_one, seat_two
+
+    return None
+
+
+def check_showtime_seats(
+    api: APIRequestContext,
+    headers: dict[str, str],
+    showtime_id: str,
+) -> tuple[str, str] | None:
+    base_url = (
+        "https://apis.cineplex.com/prod/"
+        f"ticketing/api/v1/theatre/{THEATRE_ID}/"
+        f"showtime/{showtime_id}"
+    )
+
+    layout = api_get_json(
+        api,
+        f"{base_url}/seat-layout",
+        headers,
+    )
+
+    availability = api_get_json(
+        api,
+        f"{base_url}/seat-availability",
+        headers,
+    )
+
+    if isinstance(availability, dict):
+        if availability.get("isPostShowtime") is True:
+            print("Skipping: showtime has already passed.")
+            return None
+
+        if availability.get("isSoldOut") is True:
+            print("Skipping: showtime is sold out.")
+            return None
+
+    return find_preferred_pair(
+        layout,
+        availability,
+    )
 def main() -> None:
     DEBUG_DIR.mkdir(exist_ok=True)
 
@@ -417,10 +533,109 @@ def main() -> None:
                 f"showtimeId={session['showtime_id']}",
             )
 
-        print(
+               print(
             f"\nTotal unique showtimes: "
             f"{len(final_sessions)}"
         )
+
+        print("\nSTARTING SEAT CHECKS")
+
+        matches: list[dict[str, str]] = []
+        failed_checks: list[dict[str, str]] = []
+
+        for index, session in enumerate(
+            final_sessions,
+            start=1,
+        ):
+            showtime_id = session["showtime_id"]
+            date_text = session.get("date", "")
+            start_time = session.get("start_time", "")
+
+            print(
+                f"\n[{index}/{len(final_sessions)}] "
+                f"Checking {date_text} {start_time} "
+                f"showtimeId={showtime_id}"
+            )
+
+            try:
+                pair = check_showtime_seats(
+                    context.request,
+                    captured_headers,
+                    showtime_id,
+                )
+
+            except Exception as exc:
+                print(
+                    "CHECK FAILED:",
+                    type(exc).__name__,
+                    str(exc),
+                )
+
+                failed_checks.append(
+                    {
+                        "date": date_text,
+                        "start_time": start_time,
+                        "showtime_id": showtime_id,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if pair is None:
+                print("NO MATCH")
+                continue
+
+            print(
+                f"MATCH FOUND: {pair[0]} + {pair[1]}"
+            )
+
+            matches.append(
+                {
+                    "date": date_text,
+                    "start_time": start_time,
+                    "showtime_id": showtime_id,
+                    "seat_one": pair[0],
+                    "seat_two": pair[1],
+                }
+            )
+
+        (DEBUG_DIR / "seat-matches.json").write_text(
+            json.dumps(
+                matches,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        (DEBUG_DIR / "failed-seat-checks.json").write_text(
+            json.dumps(
+                failed_checks,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        print("\nSEAT CHECK SUMMARY")
+        print(f"Showtimes checked: {len(final_sessions)}")
+        print(f"Preferred pairs found: {len(matches)}")
+        print(f"Failed checks: {len(failed_checks)}")
+
+        if matches:
+            print("\nAVAILABLE PREFERRED SEATS")
+
+            for match in matches:
+                print(
+                    match["date"],
+                    match["start_time"],
+                    f'{match["seat_one"]} + {match["seat_two"]}',
+                    f'showtimeId={match["showtime_id"]}',
+                )
+        else:
+            print(
+                "No preferred adjacent seats are currently available."
+            )
 
         context.close()
         browser.close()
