@@ -1,9 +1,12 @@
 import json
+import os
 import re
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Any
 
-from playwright.sync_api import Locator, Page, Response, sync_playwright
+import requests
+from playwright.sync_api import APIRequestContext, sync_playwright
 
 
 MOVIE_URL = (
@@ -11,452 +14,480 @@ MOVIE_URL = (
     "imax70-the-odyssey-the-imax-experience-in-7"
 )
 
-TARGET_THEATRE = "Cineplex Cinemas Langley"
+API_BASE = "https://apis.cineplex.com/prod"
+
+THEATRE_ID = 1405
+FILM_ID = 37617
+THEATRE_NAME = "Cineplex Cinemas Langley"
+
+# 依照你的优先顺序检查。
+SEAT_RULES = [
+    ("H", 10, 15),
+    ("I", 10, 15),
+    ("G", 10, 15),
+]
+
+STATE_FILE = Path("state.json")
 
 
-def safe_filename(value: str, limit: int = 120) -> str:
-    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", value)
-    return value[:limit].strip("_") or "response"
+def api_get_json(
+    api: APIRequestContext,
+    url: str,
+) -> Any:
+    """Request JSON through the browser session."""
 
+    print(f"GET {url}")
 
-def save_page(page: Page, folder: Path, name: str) -> None:
-    try:
-        page.screenshot(
-            path=str(folder / f"{name}.png"),
-            full_page=True,
+    response = api.get(
+        url,
+        timeout=60_000,
+        headers={
+            "Accept": "application/json",
+            "Referer": MOVIE_URL,
+            "Origin": "https://www.cineplex.com",
+        },
+    )
+
+    print(f"HTTP {response.status}")
+
+    if not response.ok:
+        body = response.text()
+        raise RuntimeError(
+            f"Request failed with HTTP {response.status}: "
+            f"{body[:500]}"
         )
-    except Exception as exc:
-        print(f"Could not save screenshot {name}: {exc}")
+
+    return response.json()
+
+
+def get_bookable_dates(
+    api: APIRequestContext,
+) -> list[datetime]:
+    url = (
+        f"{API_BASE}/cpx/theatrical/api/v1/dates/bookable"
+        f"?locationId={THEATRE_ID}"
+        f"&experiences=imax-70mm"
+    )
+
+    raw_dates = api_get_json(api, url)
+
+    dates: list[datetime] = []
+
+    for value in raw_dates:
+        try:
+            dates.append(
+                datetime.fromisoformat(value)
+            )
+        except (TypeError, ValueError):
+            print(f"Skipping invalid date: {value!r}")
+
+    dates.sort()
+    return dates
+
+
+def get_sessions_for_date(
+    api: APIRequestContext,
+    show_date: datetime,
+) -> list[dict[str, Any]]:
+    date_parameter = (
+        f"{show_date.month}/"
+        f"{show_date.day}/"
+        f"{show_date.year}"
+    )
+
+    url = (
+        f"{API_BASE}/cpx/theatrical/api/v1/showtimes"
+        f"?language=en"
+        f"&locationId={THEATRE_ID}"
+        f"&date={date_parameter}"
+        f"&filmId={FILM_ID}"
+        f"&experiences=imax-70mm"
+    )
+
+    payload = api_get_json(api, url)
+    sessions: list[dict[str, Any]] = []
+
+    for theatre in payload:
+        if int(theatre.get("theatreId", 0)) != THEATRE_ID:
+            continue
+
+        for date_group in theatre.get("dates", []):
+            for movie in date_group.get("movies", []):
+                if int(movie.get("id", 0)) != FILM_ID:
+                    continue
+
+                for experience in movie.get("experiences", []):
+                    experience_types = {
+                        str(value).lower()
+                        for value in experience.get(
+                            "experienceTypes",
+                            [],
+                        )
+                    }
+
+                    if not (
+                        "imax" in experience_types
+                        and "70mm" in experience_types
+                    ):
+                        continue
+
+                    for session in experience.get(
+                        "sessions",
+                        [],
+                    ):
+                        if session.get("isInThePast"):
+                            continue
+
+                        if not session.get(
+                            "isShowtimeEnabledOnline",
+                            True,
+                        ):
+                            continue
+
+                        sessions.append(session)
+
+    return sessions
+
+
+def get_seat_layout(
+    api: APIRequestContext,
+    showtime_id: int,
+) -> dict[str, Any]:
+    url = (
+        f"{API_BASE}/ticketing/api/v1/"
+        f"theatre/{THEATRE_ID}/showtime/"
+        f"{showtime_id}/seat-layout"
+    )
+
+    return api_get_json(api, url)
+
+
+def get_seat_availability(
+    api: APIRequestContext,
+    showtime_id: int,
+) -> dict[str, Any]:
+    url = (
+        f"{API_BASE}/ticketing/api/v1/"
+        f"theatre/{THEATRE_ID}/showtime/"
+        f"{showtime_id}/seat-availability"
+    )
+
+    return api_get_json(api, url)
+
+
+def build_seat_lookup(
+    layout: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Map seat IDs such as 1_3_10 to labels such as H10."""
+
+    lookup: dict[str, dict[str, Any]] = {}
+
+    areas = [
+        layout.get("standardSeats"),
+        layout.get("dboxSeats"),
+        layout.get("balconySeats"),
+    ]
+
+    for area in areas:
+        if not isinstance(area, dict):
+            continue
+
+        for row in area.get("rows", []):
+            for seat in row.get("seats", []):
+                seat_id = seat.get("id")
+
+                if seat_id:
+                    lookup[seat_id] = seat
+
+    return lookup
+
+
+def find_adjacent_pair(
+    layout: dict[str, Any],
+    availability: dict[str, Any],
+) -> tuple[str, str] | None:
+    seat_lookup = build_seat_lookup(layout)
+
+    statuses = availability.get(
+        "seatAvailabilities",
+        {},
+    )
+
+    available_labels: set[str] = set()
+
+    for seat_id, status in statuses.items():
+        if str(status).lower() != "available":
+            continue
+
+        seat = seat_lookup.get(seat_id)
+
+        if not seat:
+            continue
+
+        if seat.get("type") != "Standard":
+            continue
+
+        label = str(seat.get("label", "")).upper()
+
+        if label:
+            available_labels.add(label)
+
+    print(
+        "Available standard seats:",
+        ", ".join(sorted(available_labels)) or "none",
+    )
+
+    # 严格按照 H → I → G 的优先顺序。
+    for row, first_number, last_number in SEAT_RULES:
+        for number in range(first_number, last_number):
+            seat_one = f"{row}{number}"
+            seat_two = f"{row}{number + 1}"
+
+            if (
+                seat_one in available_labels
+                and seat_two in available_labels
+            ):
+                return seat_one, seat_two
+
+    return None
+
+
+def load_state() -> set[str]:
+    if not STATE_FILE.exists():
+        return set()
 
     try:
-        (folder / f"{name}.html").write_text(
-            page.content(),
-            encoding="utf-8",
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
         )
-    except Exception as exc:
-        print(f"Could not save HTML {name}: {exc}")
 
-    try:
-        text = page.locator("body").inner_text(timeout=15_000)
+        return set(data.get("notified", []))
+
     except Exception:
-        text = ""
+        return set()
 
-    (folder / f"{name}.txt").write_text(
-        f"URL: {page.url}\n\n{text}",
+
+def save_state(notified: set[str]) -> None:
+    STATE_FILE.write_text(
+        json.dumps(
+            {"notified": sorted(notified)},
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
 
-def click_first_visible(locator: Locator, description: str) -> bool:
-    print(f"{description}: {locator.count()} candidate(s)")
+def telegram_send(message: str) -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-    for index in range(locator.count()):
-        item = locator.nth(index)
+    if not token or not chat_id:
+        raise RuntimeError(
+            "Telegram secrets are missing."
+        )
 
-        try:
-            if not item.is_visible():
-                continue
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{token}/sendMessage"
+    )
 
-            print(f"Clicking {description} candidate #{index + 1}")
-            item.scroll_into_view_if_needed()
-            page_box = item.bounding_box()
-            print(f"Bounding box: {page_box}")
+    response = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": False,
+        },
+        timeout=30,
+    )
 
-            try:
-                item.click(timeout=10_000)
-            except Exception as exc:
-                print(f"Normal click failed: {exc}")
-                item.evaluate("element => element.click()")
-
-            return True
-
-        except Exception as exc:
-            print(
-                f"{description} candidate #{index + 1} failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    return False
+    response.raise_for_status()
 
 
-def close_cookie_banner(page: Page) -> None:
-    for label in ["OK", "Accept All", "Accept", "I Accept", "Agree"]:
-        try:
-            button = page.get_by_role(
-                "button",
-                name=label,
-                exact=True,
-            )
-
-            if button.count() and button.first.is_visible():
-                button.first.click(timeout=5_000)
-                page.wait_for_timeout(1_500)
-                print(f"Closed cookie banner: {label}")
-                return
-        except Exception:
-            pass
-
-
-def open_ticket_drawer(page: Page) -> None:
-    candidates = [
-        page.get_by_role("button", name="Get Tickets", exact=True),
-        page.get_by_role("link", name="Get Tickets", exact=True),
-        page.get_by_text("Get Tickets", exact=True),
-    ]
-
-    for candidate in candidates:
-        if click_first_visible(candidate, "Get Tickets"):
-            page.wait_for_timeout(6_000)
-            return
-
-    raise RuntimeError("Could not open ticket drawer.")
-
-
-def select_langley(page: Page) -> None:
-    theatre_candidates = [
-        page.get_by_text("Theatres", exact=True),
-        page.get_by_text("Theatre", exact=True),
-        page.get_by_role("button", name="Theatres", exact=False),
-        page.get_by_role("button", name="Theatre", exact=False),
-        page.locator("button, [role='button']").filter(
-            has_text="Theatre"
-        ),
-    ]
-
-    for candidate in theatre_candidates:
-        if click_first_visible(candidate, "theatre selector"):
-            page.wait_for_timeout(3_000)
-            break
-    else:
-        raise RuntimeError("Could not open theatre selector.")
-
-    search_candidates = [
-        page.get_by_placeholder("Search", exact=False),
-        page.get_by_placeholder("city", exact=False),
-        page.get_by_placeholder("theatre", exact=False),
-        page.get_by_role("searchbox"),
-        page.locator("input[type='search']"),
-    ]
-
-    search_field = None
-
-    for candidate in search_candidates:
-        for index in range(candidate.count()):
-            item = candidate.nth(index)
-
-            try:
-                if item.is_visible():
-                    search_field = item
-                    break
-            except Exception:
-                pass
-
-        if search_field is not None:
-            break
-
-    if search_field is None:
-        raise RuntimeError("Could not find theatre search input.")
-
-    search_field.fill("Langley")
-    page.wait_for_timeout(4_000)
-
-    results = page.get_by_text(TARGET_THEATRE, exact=True)
-
-    if not click_first_visible(results, TARGET_THEATRE):
-        results = page.get_by_text(TARGET_THEATRE, exact=False)
-
-        if not click_first_visible(results, TARGET_THEATRE):
-            raise RuntimeError("Could not select Langley theatre.")
-
-    page.wait_for_timeout(7_000)
-
-    body_text = page.locator("body").inner_text(timeout=15_000)
-
-    if TARGET_THEATRE.lower() not in body_text.lower():
-        raise RuntimeError("Langley theatre selection was not confirmed.")
-
-    print("Langley theatre selected.")
-
-
-def click_preview_seats(page: Page) -> None:
-    candidates = [
-        page.get_by_role(
-            "button",
-            name=re.compile(r"preview seats", re.IGNORECASE),
-        ),
-        page.get_by_role(
-            "link",
-            name=re.compile(r"preview seats", re.IGNORECASE),
-        ),
-        page.get_by_text(
-            re.compile(r"preview seats", re.IGNORECASE),
-        ),
-    ]
-
-    for candidate in candidates:
-        if click_first_visible(candidate, "Preview seats"):
-            print("Preview seats click issued.")
-            return
-
-    matches = page.locator(
-        "button, a, [role='button'], div, span"
-    ).filter(has_text=re.compile(r"Preview seats", re.IGNORECASE))
-
-    print(f"Preview seats fallback matches: {matches.count()}")
-
-    for index in range(min(matches.count(), 30)):
-        item = matches.nth(index)
-
-        try:
-            if not item.is_visible():
-                continue
-
-            info = item.evaluate(
-                """
-                element => ({
-                    tag: element.tagName,
-                    text: (element.innerText || "").trim(),
-                    html: element.outerHTML
-                })
-                """
-            )
-
-            print(f"Preview fallback element: {info}")
-
-            item.evaluate(
-                """
-                element => {
-                    const clickable = element.closest(
-                        'button, a, [role="button"]'
-                    );
-                    (clickable || element).click();
-                }
-                """
-            )
-
-            print("Preview seats JavaScript fallback click issued.")
-            return
-
-        except Exception as exc:
-            print(f"Preview fallback failed: {exc}")
-
-    raise RuntimeError("Could not find or click Preview seats.")
+def format_showtime(
+    raw_value: str,
+) -> str:
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+        return parsed.strftime("%A, %B %d, %Y at %I:%M %p")
+    except (TypeError, ValueError):
+        return raw_value
 
 
 def main() -> None:
-    debug_dir = Path("debug")
-    responses_dir = debug_dir / "responses"
+    print("Starting real Langley IMAX 70mm seat check")
 
-    debug_dir.mkdir(exist_ok=True)
-    responses_dir.mkdir(exist_ok=True)
-
-    network_lines: list[str] = []
-    response_counter = 0
-
-    interesting_keywords = [
-        "seat",
-        "preview",
-        "showtime",
-        "performance",
-        "availability",
-        "auditorium",
-        "layout",
-        "booking",
-        "ticket",
-        "reservation",
-        "checkout",
-        "connect.cineplex",
-        "apis.cineplex",
-    ]
+    notified = load_state()
+    new_notifications = 0
+    sessions_checked = 0
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
+                "--disable-blink-features="
+                "AutomationControlled",
             ],
         )
 
         context = browser.new_context(
-            viewport={"width": 1440, "height": 1200},
             locale="en-CA",
             timezone_id="America/Vancouver",
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Mozilla/5.0 "
+                "(Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
         )
 
         page = context.new_page()
 
-        def record_request(request) -> None:
-            url_lower = request.url.lower()
+        # 先访问 Cineplex 页面，让浏览器取得正常会话和 Cookie。
+        response = page.goto(
+            MOVIE_URL,
+            wait_until="domcontentloaded",
+            timeout=90_000,
+        )
 
-            if any(word in url_lower for word in interesting_keywords):
-                line = f"REQUEST {request.method} {request.url}"
-                print(line)
-                network_lines.append(line)
+        print(
+            "Cineplex page HTTP:",
+            response.status if response else "none",
+        )
 
-        def record_response(response: Response) -> None:
-            nonlocal response_counter
+        page.wait_for_timeout(8_000)
 
-            url_lower = response.url.lower()
+        bookable_dates = get_bookable_dates(
+            context.request
+        )
 
-            if not any(
-                word in url_lower
-                for word in interesting_keywords
-            ):
-                return
+        print(
+            f"Bookable dates found: "
+            f"{len(bookable_dates)}"
+        )
 
-            line = (
-                f"RESPONSE {response.status} "
-                f"{response.request.method} {response.url}"
+        for show_date in bookable_dates:
+            print(
+                "\nChecking date:",
+                show_date.date().isoformat(),
             )
 
-            print(line)
-            network_lines.append(line)
-
             try:
-                content_type = (
-                    response.headers.get("content-type", "").lower()
+                sessions = get_sessions_for_date(
+                    context.request,
+                    show_date,
                 )
-
-                if (
-                    "json" not in content_type
-                    and "text" not in content_type
-                    and "javascript" not in content_type
-                ):
-                    return
-
-                body = response.text()
-
-                if not body:
-                    return
-
-                response_counter += 1
-                parsed_url = urlparse(response.url)
-                name = safe_filename(
-                    f"{response_counter:03d}_"
-                    f"{parsed_url.netloc}_"
-                    f"{parsed_url.path}"
-                )
-
-                extension = (
-                    ".json"
-                    if "json" in content_type
-                    else ".txt"
-                )
-
-                output_path = responses_dir / f"{name}{extension}"
-                output_path.write_text(body, encoding="utf-8")
-
-                meta_path = responses_dir / f"{name}.meta.txt"
-                meta_path.write_text(
-                    "\n".join(
-                        [
-                            f"URL: {response.url}",
-                            f"Status: {response.status}",
-                            f"Method: {response.request.method}",
-                            f"Content-Type: {content_type}",
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-
-                print(f"Saved response body: {output_path}")
-
             except Exception as exc:
                 print(
-                    f"Could not save response body: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"Could not load showtimes: {exc}"
+                )
+                continue
+
+            for session in sessions:
+                showtime_id = int(
+                    session["vistaSessionId"]
                 )
 
-        page.on("request", record_request)
-        page.on("response", record_response)
-
-        try:
-            response = page.goto(
-                MOVIE_URL,
-                wait_until="domcontentloaded",
-                timeout=90_000,
-            )
-
-            print(
-                "Initial HTTP status:",
-                response.status if response else "none",
-            )
-
-            page.wait_for_timeout(10_000)
-            close_cookie_banner(page)
-
-            open_ticket_drawer(page)
-            select_langley(page)
-
-            save_page(
-                page,
-                debug_dir,
-                "01-before-preview-seats",
-            )
-
-            click_preview_seats(page)
-
-            print("Waiting for preview-seat response...")
-            page.wait_for_timeout(20_000)
-
-            print(f"Current URL: {page.url}")
-            print(f"Open browser pages: {len(context.pages)}")
-
-            for index, current_page in enumerate(
-                context.pages,
-                start=1,
-            ):
-                try:
-                    current_page.wait_for_load_state(
-                        "domcontentloaded",
-                        timeout=20_000,
+                start_time = str(
+                    session.get(
+                        "showStartDateTime",
+                        "",
                     )
-                except Exception:
-                    pass
+                )
+
+                sessions_checked += 1
 
                 print(
-                    f"PAGE #{index}: "
-                    f"title={current_page.title()!r}, "
-                    f"url={current_page.url}"
+                    f"\nChecking showtime "
+                    f"{showtime_id}: "
+                    f"{start_time}"
                 )
 
-                save_page(
-                    current_page,
-                    debug_dir,
-                    f"02-after-preview-page-{index}",
+                try:
+                    layout = get_seat_layout(
+                        context.request,
+                        showtime_id,
+                    )
+
+                    availability = (
+                        get_seat_availability(
+                            context.request,
+                            showtime_id,
+                        )
+                    )
+
+                    pair = find_adjacent_pair(
+                        layout,
+                        availability,
+                    )
+
+                except Exception as exc:
+                    print(
+                        f"Seat check failed for "
+                        f"{showtime_id}: {exc}"
+                    )
+                    continue
+
+                if not pair:
+                    print(
+                        "No preferred adjacent pair."
+                    )
+                    continue
+
+                seat_one, seat_two = pair
+
+                notification_key = (
+                    f"{showtime_id}:"
+                    f"{seat_one}:{seat_two}"
                 )
 
-            print(
-                f"Saved {response_counter} relevant response bodies."
-            )
+                preview_url = (
+                    "https://www.cineplex.com/"
+                    "en/ticketing/preview"
+                    f"?theatreId={THEATRE_ID}"
+                    f"&showtimeId={showtime_id}"
+                    "&dbox=false"
+                )
 
-        except Exception as exc:
-            print(
-                f"PREVIEW-SEATS TEST FAILED: "
-                f"{type(exc).__name__}: {exc}"
-            )
+                print(
+                    "MATCH FOUND:",
+                    seat_one,
+                    seat_two,
+                )
 
-            try:
-                save_page(page, debug_dir, "error")
-            except Exception:
-                pass
+                if notification_key in notified:
+                    print(
+                        "This exact result was already "
+                        "notified."
+                    )
+                    continue
 
-            raise
+                message = (
+                    "🎬 The Odyssey — IMAX 70mm\n\n"
+                    f"📍 {THEATRE_NAME}\n"
+                    f"🗓 {format_showtime(start_time)}\n"
+                    f"🪑 {seat_one} + {seat_two}\n\n"
+                    f"Book / preview:\n{preview_url}"
+                )
 
-        finally:
-            (debug_dir / "network-log.txt").write_text(
-                "\n".join(network_lines),
-                encoding="utf-8",
-            )
+                telegram_send(message)
 
-            context.close()
-            browser.close()
+                notified.add(notification_key)
+                new_notifications += 1
+                save_state(notified)
+
+        context.close()
+        browser.close()
+
+    print("\nSeat check finished.")
+    print(f"Sessions checked: {sessions_checked}")
+    print(
+        f"New Telegram notifications: "
+        f"{new_notifications}"
+    )
 
 
 if __name__ == "__main__":
