@@ -1,8 +1,7 @@
 from pathlib import Path
-from urllib.parse import urljoin
+from typing import Any
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, sync_playwright
 
 
 MOVIE_URL = (
@@ -11,121 +10,111 @@ MOVIE_URL = (
 )
 
 
-def save_debug(page: Page, debug_dir: Path, name: str) -> None:
-    """Save screenshot, HTML and visible page text."""
-
-    page.screenshot(
-        path=str(debug_dir / f"{name}.png"),
-        full_page=True,
-    )
-
-    (debug_dir / f"{name}.html").write_text(
-        page.content(),
-        encoding="utf-8",
-    )
+def save_page(page: Page, folder: Path, name: str) -> None:
+    """Save screenshot, HTML, visible text and current URL."""
 
     try:
-        body_text = page.locator("body").inner_text(timeout=15_000)
-    except Exception:
-        body_text = ""
+        page.screenshot(
+            path=str(folder / f"{name}.png"),
+            full_page=True,
+        )
+    except Exception as exc:
+        print(f"Could not save screenshot {name}: {exc}")
 
-    (debug_dir / f"{name}.txt").write_text(
-        body_text,
+    try:
+        (folder / f"{name}.html").write_text(
+            page.content(),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"Could not save HTML {name}: {exc}")
+
+    try:
+        text = page.locator("body").inner_text(timeout=15_000)
+    except Exception:
+        text = ""
+
+    (folder / f"{name}.txt").write_text(
+        f"URL: {page.url}\n\n{text}",
         encoding="utf-8",
     )
 
 
-def close_popups(page: Page) -> None:
-    """Close common cookie/privacy popups when present."""
+def close_cookie_banner(page: Page) -> None:
+    """Close the cookie banner visible at the bottom of the page."""
 
-    labels = [
-        "Accept All",
+    possible_buttons = [
+        "OK",
         "Accept",
+        "Accept All",
         "I Accept",
         "Agree",
         "Got it",
-        "OK",
     ]
 
-    for label in labels:
+    for label in possible_buttons:
         try:
             button = page.get_by_role(
                 "button",
                 name=label,
-                exact=False,
+                exact=True,
             )
 
-            if button.count() > 0 and button.first.is_visible():
-                button.first.click(timeout=3_000)
-                print(f"Closed popup: {label}")
+            if button.count() and button.first.is_visible():
+                print(f"Closing cookie banner with: {label}")
+                button.first.click(timeout=5_000)
                 page.wait_for_timeout(1_500)
                 return
         except Exception:
             pass
 
+    print("No cookie button was closed.")
 
-def print_links_and_buttons(page: Page) -> None:
-    """Print useful page controls to the Actions log."""
 
-    print("\nVISIBLE BUTTONS:")
+def describe_get_tickets(page: Page) -> None:
+    """Print details about every element containing Get Tickets."""
 
-    buttons = page.get_by_role("button")
+    matches = page.get_by_text("Get Tickets", exact=True)
+    print(f"Exact Get Tickets matches: {matches.count()}")
 
-    for index in range(min(buttons.count(), 50)):
+    for index in range(matches.count()):
+        item = matches.nth(index)
+
         try:
-            button = buttons.nth(index)
+            info: dict[str, Any] = item.evaluate(
+                """
+                element => ({
+                    tag: element.tagName,
+                    text: element.innerText,
+                    href: element.href || null,
+                    role: element.getAttribute('role'),
+                    className: element.className,
+                    outerHTML: element.outerHTML
+                })
+                """
+            )
 
-            if not button.is_visible():
-                continue
+            print(f"GET TICKETS ELEMENT #{index + 1}")
+            print(info)
+            print(f"Visible: {item.is_visible()}")
 
-            text = button.inner_text().strip()
-
-            if text:
-                print(f"BUTTON: {text}")
-        except Exception:
-            pass
-
-    print("\nVISIBLE LINKS:")
-
-    links = page.locator("a")
-
-    for index in range(min(links.count(), 100)):
-        try:
-            link = links.nth(index)
-
-            if not link.is_visible():
-                continue
-
-            text = link.inner_text().strip()
-            href = link.get_attribute("href")
-
-            if text or href:
-                absolute_href = (
-                    urljoin(page.url, href)
-                    if href
-                    else ""
-                )
-
-                print(
-                    f"LINK: {text!r} -> {absolute_href}"
-                )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Could not inspect match #{index + 1}: {exc}")
 
 
-def click_get_tickets(page: Page) -> bool:
-    """Try several robust ways to click Get Tickets."""
+def click_get_tickets(page: Page) -> None:
+    """Click the visible Get Tickets control using robust fallbacks."""
 
     candidates = [
         page.get_by_role(
             "button",
             name="Get Tickets",
-            exact=False,
+            exact=True,
         ),
         page.get_by_role(
             "link",
             name="Get Tickets",
-            exact=False,
+            exact=True,
         ),
         page.get_by_text(
             "Get Tickets",
@@ -133,111 +122,138 @@ def click_get_tickets(page: Page) -> bool:
         ),
     ]
 
-    for candidate in candidates:
-        try:
-            count = candidate.count()
+    for group_number, candidate in enumerate(candidates, start=1):
+        count = candidate.count()
+        print(f"Candidate group {group_number}: {count} matches")
 
-            print(
-                "Get Tickets candidate count:",
-                count,
-            )
+        for index in range(count):
+            item = candidate.nth(index)
 
-            for index in range(count):
-                item = candidate.nth(index)
-
+            try:
                 if not item.is_visible():
                     continue
 
                 print(
-                    f"Clicking visible Get Tickets "
-                    f"candidate #{index + 1}"
+                    f"Using candidate group {group_number}, "
+                    f"item {index + 1}"
                 )
 
                 item.scroll_into_view_if_needed()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1_000)
 
+                box = item.bounding_box()
+                print(f"Bounding box: {box}")
+
+                # First attempt: normal Playwright click.
                 try:
-                    with page.expect_navigation(
-                        wait_until="domcontentloaded",
-                        timeout=20_000,
-                    ):
-                        item.click(timeout=10_000)
-                except PlaywrightTimeoutError:
-                    # Many modern websites update without a traditional
-                    # browser navigation event.
-                    item.click(
-                        timeout=10_000,
-                        force=True,
+                    item.click(timeout=10_000)
+                    print("Normal Playwright click completed.")
+                    return
+                except Exception as exc:
+                    print(
+                        "Normal click failed:",
+                        type(exc).__name__,
+                        str(exc),
                     )
 
-                return True
+                # Second attempt: click the centre with the mouse.
+                if box:
+                    page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
+                    print("Mouse-coordinate click completed.")
+                    return
 
-        except Exception as exc:
-            print(
-                "Candidate click error:",
-                type(exc).__name__,
-                str(exc),
-            )
+                # Final attempt: dispatch the browser click event.
+                item.evaluate("element => element.click()")
+                print("JavaScript click completed.")
+                return
 
-    return False
+            except Exception as exc:
+                print(
+                    f"Candidate item failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    raise RuntimeError("No visible Get Tickets control could be clicked.")
 
 
 def main() -> None:
     debug_dir = Path("debug")
     debug_dir.mkdir(exist_ok=True)
 
-    print("Starting Odyssey IMAX 70mm ticket-page test")
+    print("Starting Cineplex Get Tickets investigation")
     print(f"Movie URL: {MOVIE_URL}")
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
         context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 1200,
-            },
+            viewport={"width": 1440, "height": 1200},
             locale="en-CA",
             timezone_id="America/Vancouver",
             user_agent=(
-                "Mozilla/5.0 "
-                "(Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
         )
 
         page = context.new_page()
 
-        # Record network responses that may reveal the current
-        # showtime or ticket API.
-        def log_response(response) -> None:
+        page.on(
+            "console",
+            lambda message: print(
+                f"BROWSER CONSOLE [{message.type}]: {message.text}"
+            ),
+        )
+
+        page.on(
+            "dialog",
+            lambda dialog: (
+                print(
+                    f"BROWSER DIALOG: "
+                    f"{dialog.type}: {dialog.message}"
+                ),
+                dialog.accept(),
+            ),
+        )
+
+        def record_response(response) -> None:
             url = response.url.lower()
 
-            keywords = [
+            important_words = [
                 "showtime",
                 "performance",
-                "schedule",
-                "ticket",
                 "seat",
+                "ticket",
+                "booking",
+                "schedule",
                 "theatre",
-                "movie",
             ]
 
-            if any(keyword in url for keyword in keywords):
+            if any(word in url for word in important_words):
                 print(
-                    f"NETWORK {response.status}: "
+                    f"NETWORK RESPONSE {response.status}: "
                     f"{response.url}"
                 )
 
-        page.on("response", log_response)
+        page.on("response", record_response)
+
+        opened_pages: list[Page] = []
+
+        def record_new_page(new_page: Page) -> None:
+            print("NEW PAGE OR POPUP DETECTED")
+            opened_pages.append(new_page)
+
+        context.on("page", record_new_page)
 
         try:
             response = page.goto(
@@ -252,56 +268,61 @@ def main() -> None:
             )
 
             page.wait_for_timeout(10_000)
-            close_popups(page)
+            close_cookie_banner(page)
+            page.wait_for_timeout(2_000)
 
-            print(f"Initial title: {page.title()}")
-            print(f"Initial URL: {page.url}")
+            print(f"Before-click URL: {page.url}")
+            print(f"Before-click title: {page.title()}")
 
-            save_debug(
+            save_page(
                 page,
                 debug_dir,
-                "01-movie-page",
+                "01-before-click",
             )
 
-            print_links_and_buttons(page)
+            describe_get_tickets(page)
+            click_get_tickets(page)
 
-            clicked = click_get_tickets(page)
+            print("Click issued. Waiting for website response...")
+            page.wait_for_timeout(15_000)
 
-            print(f"Get Tickets clicked: {clicked}")
+            print(f"Original page URL after click: {page.url}")
+            print(f"Number of browser pages: {len(context.pages)}")
 
-            if not clicked:
-                raise RuntimeError(
-                    "Could not find a visible Get Tickets control."
+            for index, open_page in enumerate(
+                context.pages,
+                start=1,
+            ):
+                try:
+                    open_page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=30_000,
+                    )
+                except Exception:
+                    pass
+
+                print(
+                    f"PAGE #{index}: "
+                    f"title={open_page.title()!r}, "
+                    f"url={open_page.url}"
                 )
 
-            page.wait_for_timeout(12_000)
+                save_page(
+                    open_page,
+                    debug_dir,
+                    f"02-result-page-{index}",
+                )
 
-            print(f"After-click title: {page.title()}")
-            print(f"After-click URL: {page.url}")
-
-            close_popups(page)
-
-            save_debug(
-                page,
-                debug_dir,
-                "02-after-get-tickets",
-            )
-
-            print_links_and_buttons(page)
-
-            print(
-                "SUCCESS: Ticket flow opened. "
-                "Review the second screenshot and Actions log."
-            )
+            print("Investigation finished successfully.")
 
         except Exception as exc:
             print(
-                f"TEST FAILED: "
+                f"INVESTIGATION FAILED: "
                 f"{type(exc).__name__}: {exc}"
             )
 
             try:
-                save_debug(
+                save_page(
                     page,
                     debug_dir,
                     "error",
