@@ -1,7 +1,5 @@
-import json
-import re
 from pathlib import Path
-from typing import Any
+from urllib.parse import urlparse
 
 from playwright.sync_api import Locator, Page, sync_playwright
 
@@ -14,16 +12,25 @@ MOVIE_URL = (
 TARGET_THEATRE = "Cineplex Cinemas Langley"
 
 
-def save_debug(page: Page, folder: Path, name: str) -> None:
-    page.screenshot(
-        path=str(folder / f"{name}.png"),
-        full_page=True,
-    )
+def save_page(page: Page, folder: Path, name: str) -> None:
+    """Save screenshot, HTML, visible text and URL."""
 
-    (folder / f"{name}.html").write_text(
-        page.content(),
-        encoding="utf-8",
-    )
+    try:
+        page.screenshot(
+            path=str(folder / f"{name}.png"),
+            full_page=True,
+        )
+    except Exception as exc:
+        print(f"Screenshot failed for {name}: {exc}")
+
+    try:
+        html = page.content()
+        (folder / f"{name}.html").write_text(
+            html,
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"HTML save failed for {name}: {exc}")
 
     try:
         text = page.locator("body").inner_text(timeout=15_000)
@@ -36,7 +43,7 @@ def save_debug(page: Page, folder: Path, name: str) -> None:
     )
 
 
-def click_first_visible(locator: Locator, description: str) -> bool:
+def click_first_visible(locator: Locator, label: str) -> bool:
     for index in range(locator.count()):
         item = locator.nth(index)
 
@@ -44,14 +51,14 @@ def click_first_visible(locator: Locator, description: str) -> bool:
             if not item.is_visible():
                 continue
 
-            print(f"Clicking {description} candidate #{index + 1}")
+            print(f"Clicking {label} candidate #{index + 1}")
             item.scroll_into_view_if_needed()
             item.click(timeout=10_000)
             return True
 
         except Exception as exc:
             print(
-                f"{description} click failed: "
+                f"{label} click failed: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -91,8 +98,8 @@ def open_ticket_drawer(page: Page) -> None:
     raise RuntimeError("Could not open the ticket drawer.")
 
 
-def open_theatre_selector(page: Page) -> None:
-    candidates = [
+def select_langley(page: Page) -> None:
+    theatre_candidates = [
         page.get_by_text("Theatres", exact=True),
         page.get_by_text("Theatre", exact=True),
         page.get_by_role("button", name="Theatres", exact=False),
@@ -102,15 +109,17 @@ def open_theatre_selector(page: Page) -> None:
         ),
     ]
 
-    for candidate in candidates:
+    opened = False
+
+    for candidate in theatre_candidates:
         if click_first_visible(candidate, "theatre selector"):
+            opened = True
             page.wait_for_timeout(3_000)
-            return
+            break
 
-    raise RuntimeError("Could not open theatre selector.")
+    if not opened:
+        raise RuntimeError("Could not open theatre selector.")
 
-
-def search_and_choose_langley(page: Page) -> None:
     search_candidates = [
         page.get_by_placeholder("Search", exact=False),
         page.get_by_placeholder("city", exact=False),
@@ -132,14 +141,13 @@ def search_and_choose_langley(page: Page) -> None:
             except Exception:
                 pass
 
-        if search_field:
+        if search_field is not None:
             break
 
-    if not search_field:
+    if search_field is None:
         raise RuntimeError("Could not find theatre search field.")
 
     search_field.fill("Langley")
-    print("Entered Langley in theatre search.")
     page.wait_for_timeout(4_000)
 
     results = page.get_by_text(TARGET_THEATRE, exact=True)
@@ -148,119 +156,66 @@ def search_and_choose_langley(page: Page) -> None:
         results = page.get_by_text(TARGET_THEATRE, exact=False)
 
         if not click_first_visible(results, TARGET_THEATRE):
-            raise RuntimeError(
-                "Could not select Cineplex Cinemas Langley."
-            )
+            raise RuntimeError("Could not select Langley theatre.")
 
     page.wait_for_timeout(7_000)
 
+    body_text = page.locator("body").inner_text(timeout=15_000)
 
-def element_info(item: Locator) -> dict[str, Any]:
-    return item.evaluate(
-        """
-        element => {
-            const clickable = element.closest(
-                'button, a, [role="button"]'
-            ) || element;
+    if TARGET_THEATRE.lower() not in body_text.lower():
+        raise RuntimeError("Langley selection could not be confirmed.")
 
-            return {
-                tag: element.tagName,
-                text: (element.innerText || "").trim(),
-                ariaLabel: element.getAttribute("aria-label"),
-                href: clickable.href || clickable.getAttribute("href"),
-                clickableTag: clickable.tagName,
-                clickableText: (clickable.innerText || "").trim(),
-                clickableHTML: clickable.outerHTML
-            };
-        }
-        """
+    print("Langley theatre selected successfully.")
+
+
+def find_showtime_buttons(page: Page) -> list[Locator]:
+    """Return all visible buttons whose aria-label starts with Book show at."""
+
+    locator = page.locator(
+        'button[aria-label^="Book show at"]'
     )
 
+    buttons: list[Locator] = []
 
-def discover_showtimes(page: Page, folder: Path) -> list[dict[str, Any]]:
-    print("\nDiscovering all visible showtime controls...")
+    print(f"Book-show button count: {locator.count()}")
 
-    time_pattern = re.compile(
-        r"\b(?:1[0-2]|0?[1-9]):[0-5][0-9]\s*(?:AM|PM)\b",
-        re.IGNORECASE,
-    )
-
-    candidates = page.locator(
-        "button, a, [role='button'], time"
-    )
-
-    discovered: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    print(f"Interactive candidate count: {candidates.count()}")
-
-    for index in range(candidates.count()):
-        item = candidates.nth(index)
+    for index in range(locator.count()):
+        item = locator.nth(index)
 
         try:
             if not item.is_visible():
                 continue
 
+            label = item.get_attribute("aria-label")
             text = item.inner_text().strip()
-            aria_label = item.get_attribute("aria-label") or ""
-            combined = f"{text} {aria_label}".strip()
 
-            if not combined:
-                continue
-
-            is_time = bool(time_pattern.search(combined))
-            is_relevant_format = any(
-                word in combined.lower()
-                for word in [
-                    "imax",
-                    "70mm",
-                    "odyssey",
-                    "showtime",
-                ]
+            print(
+                f"SHOWTIME #{len(buttons) + 1}: "
+                f"text={text!r}, aria-label={label!r}"
             )
 
-            if not is_time and not is_relevant_format:
-                continue
-
-            info = element_info(item)
-            unique_key = (
-                info.get("clickableHTML")
-                or info.get("clickableText")
-                or combined
-            )
-
-            if unique_key in seen:
-                continue
-
-            seen.add(unique_key)
-            discovered.append(info)
-
-            print("\nSHOWTIME CANDIDATE")
-            print(json.dumps(info, ensure_ascii=False, indent=2))
+            buttons.append(item)
 
         except Exception as exc:
-            print(
-                f"Could not inspect candidate #{index + 1}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            print(f"Could not inspect showtime #{index + 1}: {exc}")
 
-    (folder / "showtime-candidates.json").write_text(
-        json.dumps(
-            discovered,
-            ensure_ascii=False,
-            indent=2,
-        ),
+    return buttons
+
+
+def save_network_log(lines: list[str], folder: Path) -> None:
+    (folder / "network-log.txt").write_text(
+        "\n".join(lines),
         encoding="utf-8",
     )
-
-    return discovered
 
 
 def main() -> None:
     debug_dir = Path("debug")
     debug_dir.mkdir(exist_ok=True)
 
-    print("Starting Langley all-showtimes discovery test")
+    network_log: list[str] = []
+
+    print("Starting Cineplex showtime-click investigation")
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
@@ -284,6 +239,31 @@ def main() -> None:
 
         page = context.new_page()
 
+        def record_response(response) -> None:
+            url_lower = response.url.lower()
+
+            keywords = [
+                "seat",
+                "showtime",
+                "performance",
+                "booking",
+                "ticket",
+                "checkout",
+                "reservation",
+                "schedule",
+            ]
+
+            if any(word in url_lower for word in keywords):
+                line = (
+                    f"{response.status} "
+                    f"{response.request.method} "
+                    f"{response.url}"
+                )
+                print(f"NETWORK: {line}")
+                network_log.append(line)
+
+        page.on("response", record_response)
+
         try:
             response = page.goto(
                 MOVIE_URL,
@@ -300,47 +280,84 @@ def main() -> None:
             close_cookie_banner(page)
 
             open_ticket_drawer(page)
-            open_theatre_selector(page)
-            search_and_choose_langley(page)
+            select_langley(page)
 
-            print("Langley theatre selected.")
-            save_debug(
+            save_page(
                 page,
                 debug_dir,
                 "01-langley-showtimes",
             )
 
-            showtimes = discover_showtimes(
-                page,
-                debug_dir,
-            )
-
-            print(
-                f"\nTotal relevant showtime candidates found: "
-                f"{len(showtimes)}"
-            )
+            showtimes = find_showtime_buttons(page)
 
             if not showtimes:
                 raise RuntimeError(
-                    "No visible showtime controls were detected."
+                    "No bookable showtime buttons were found."
                 )
 
-            print(
-                "SUCCESS: Langley showtime candidates were saved."
-            )
+            first_showtime = showtimes[0]
+            selected_time = first_showtime.inner_text().strip()
+
+            print(f"Testing first available showtime: {selected_time}")
+
+            pages_before = len(context.pages)
+            old_url = page.url
+
+            first_showtime.scroll_into_view_if_needed()
+            first_showtime.click(timeout=15_000)
+
+            print("Showtime click issued.")
+            page.wait_for_timeout(15_000)
+
+            print(f"Original URL before click: {old_url}")
+            print(f"Original page URL now: {page.url}")
+            print(f"Browser pages before click: {pages_before}")
+            print(f"Browser pages after click: {len(context.pages)}")
+
+            for index, current_page in enumerate(
+                context.pages,
+                start=1,
+            ):
+                try:
+                    current_page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=30_000,
+                    )
+                except Exception:
+                    pass
+
+                title = ""
+
+                try:
+                    title = current_page.title()
+                except Exception:
+                    pass
+
+                print(
+                    f"PAGE #{index}: "
+                    f"title={title!r}, "
+                    f"url={current_page.url}"
+                )
+
+                save_page(
+                    current_page,
+                    debug_dir,
+                    f"02-after-showtime-page-{index}",
+                )
+
+            save_network_log(network_log, debug_dir)
+
+            print("Showtime-click investigation finished.")
 
         except Exception as exc:
             print(
-                f"SHOWTIME DISCOVERY FAILED: "
+                f"SHOWTIME CLICK FAILED: "
                 f"{type(exc).__name__}: {exc}"
             )
 
             try:
-                save_debug(
-                    page,
-                    debug_dir,
-                    "error",
-                )
+                save_page(page, debug_dir, "error")
+                save_network_log(network_log, debug_dir)
             except Exception:
                 pass
 
