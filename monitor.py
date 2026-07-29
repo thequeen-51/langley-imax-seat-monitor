@@ -547,6 +547,15 @@ def check_showtime_seats(
         headers,
     )
 
+    print(
+        "LAYOUT JSON SAMPLE:",
+        json.dumps(
+            layout,
+            ensure_ascii=False,
+        )[:8000],
+
+    )
+
     availability = api_get_json(
         api,
         f"{base_url}/seat-availability",
