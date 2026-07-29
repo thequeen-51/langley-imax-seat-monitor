@@ -427,32 +427,80 @@ def find_preferred_pair(
 
     seat_lookup = build_seat_lookup(layout)
 
-    if not isinstance(availability, dict):
-        return None
-
-    statuses = availability.get(
-        "seatAvailabilities",
-        {},
+    print(
+        "Seat labels found in layout:",
+        len(seat_lookup),
     )
 
-    if not isinstance(statuses, dict):
-        return None
+    available_seat_ids: set[str] = set()
 
-    available_labels: set[str] = set()
+    def walk_availability(item: Any) -> None:
+        """
+        Recursively find available seat IDs regardless of
+        the exact Cineplex JSON structure.
+        """
 
-    for seat_id, status in statuses.items():
-        if str(status).lower() != "available":
-            continue
+        if isinstance(item, dict):
+            seat_id = (
+                item.get("id")
+                or item.get("seatId")
+                or item.get("seatID")
+            )
 
-        label = seat_lookup.get(str(seat_id))
+            status = (
+                item.get("status")
+                or item.get("availability")
+                or item.get("seatStatus")
+                or item.get("state")
+            )
 
-        if label:
-            available_labels.add(label)
+            if (
+                seat_id is not None
+                and status is not None
+                and str(status).strip().lower()
+                == "available"
+            ):
+                available_seat_ids.add(
+                    str(seat_id)
+                )
+
+            for key, value in item.items():
+                if (
+                    isinstance(value, str)
+                    and value.strip().lower()
+                    == "available"
+                    and str(key) in seat_lookup
+                ):
+                    available_seat_ids.add(
+                        str(key)
+                    )
+
+                walk_availability(value)
+
+        elif isinstance(item, list):
+            for child in item:
+                walk_availability(child)
+
+    walk_availability(availability)
+
+    print(
+        "Available seat IDs found:",
+        len(available_seat_ids),
+    )
+
+    available_labels: set[str] = {
+        seat_lookup[seat_id]
+        for seat_id in available_seat_ids
+        if seat_id in seat_lookup
+    }
 
     preferred_available = sorted(
         label
         for label in available_labels
-        if label[:1] in {"H", "I", "G"}
+        if re.fullmatch(
+            r"[HIG]\d+",
+            label,
+        )
     )
 
     print(
@@ -479,7 +527,6 @@ def find_preferred_pair(
                 return seat_one, seat_two
 
     return None
-
 
 def check_showtime_seats(
     api: APIRequestContext,
