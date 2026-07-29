@@ -553,6 +553,14 @@ def check_showtime_seats(
         headers,
     )
 
+    print(
+        "AVAILABILITY JSON SAMPLE:",
+        json.dumps(
+            availability,
+            ensure_ascii=False,
+        )[:5000],
+    )
+
     if isinstance(availability, dict):
         if (
             availability.get("isPostShowtime")
