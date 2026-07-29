@@ -259,15 +259,8 @@ def check_showtime_seats(
 
 
 def main() -> None:
-    """Run the complete Langley IMAX 70mm seat check."""
-
     DEBUG_DIR.mkdir(exist_ok=True)
-
-    print(
-        "Starting Langley IMAX 70mm monitor."
-    )
-
-    send_telegram("✅ Cineplex monitor is running.")
+    print("Starting Langley IMAX 70mm monitor.")
     captured_headers: dict[str, str] | None = None
 
     with sync_playwright() as playwright:
