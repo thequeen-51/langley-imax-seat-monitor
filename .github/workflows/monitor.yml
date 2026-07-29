@@ -5,14 +5,26 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+concurrency:
+  group: cineplex-seat-monitor
+  cancel-in-progress: true
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Restore notification state
+        uses: actions/cache@v4
+        with:
+          path: .monitor-state
+          key: cineplex-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            cineplex-monitor-state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,7 +47,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cineplex-seat-monitor
+          name: cineplex-seat-monitor-${{ github.run_id }}
           path: debug/
           if-no-files-found: warn
           retention-days: 3
